@@ -82,11 +82,11 @@ Configure these options via environment variables:
         USER_JOINED
             │
             ▼
-        PENDING ◄──────────── reaper (30s stale)
+        PENDING ◄──────────── reaper (30s stale without heartbeat)
         │    │
-        │    ├── /authorize (signed EIP-3009) ──► AUTHORIZED
+        │    ├── /authorize (signed EIP-3009) ──► AUTHORIZED (starts 10s heartbeat)
         │    │
-        │    └── /decline  ─────────────────────► DECLINED
+        │    └── /decline  ─────────────────────► DECLINED (starts 10s heartbeat)
         │
         │  (USER_PARTED before authorize)
         ▼
@@ -95,3 +95,22 @@ Configure these options via environment variables:
         ▼
    AUTHORIZED + USER_PARTED ──► /settle (onchain via Web3.py) ──► SETTLED
 ```
+
+---
+
+## 💡 How It Works under the Hood
+
+### 1. Gasless Viewer Payments (EIP-3009)
+The project utilizes the **USDC EIP-3009 (TransferWithAuthorization)** protocol to allow viewers to pay streamers completely gaslessly:
+- **EIP-712 Signature**: The viewer signs an off-chain authorization stating they permit the streamer to transfer a maximum USDC amount (e.g. `$0.05` for 5 min) before a specific expiration block.
+- **On-chain Settlement**: The viewer does not execute the blockchain transaction and does not need any native gas token (ETH/ARC). Instead, the streamer's server captures this signed authorization and submits it to the Arc Testnet USDC contract on `USER_PARTED`, paying the gas fee.
+
+### 2. Self-Healing Wallet Mismatch Recovery
+Web3 browser environments often have multiple accounts connected, and the active account selected in the MetaMask extension window may differ from the site's primary connected account. 
+- **Signer Verification**: The sidecar backend validates the EIP-712 signature locally using `eth_account.messages.encode_typed_data` to recover the signer.
+- **Signer Mismatch Recovery**: If the recovered signer address (e.g. `0xc973...`) does not match the browser's stated `from` address (e.g. `0x2cf5...`), the backend returns a `400` error with `error: "signer_mismatch"`. The browser frontend automatically catches this error, updates its internal address variables to the recovered signer, and automatically re-prompts the user with the correct parameters, resolving mismatch issues transparently.
+
+### 3. Heartbeat-Aware Session Reaper
+Owncast only fires `USER_JOINED` and `USER_PARTED` webhooks. If a connection is dropped or a server restarts, the `USER_PARTED` event might be missed.
+- **Heartbeat Loop**: To safely prune dropped sessions without affecting active viewers, the browser script sends a periodic keepalive ping to `/session/<auth_request_id>` every 10 seconds.
+- **Reaper**: The sidecar backend maintains a thread-safe `last_seen_at` timestamp. The reaper daemon prunes only sessions that have gone silent (no heartbeat) for more than 30 seconds.

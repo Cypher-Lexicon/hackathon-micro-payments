@@ -94,7 +94,11 @@
     }).then(function (r) {
       return r.json()
     }).then(function (data) {
-      if (!data.ok) throw new Error(data.error || 'POST failed')
+      if (!data.ok) {
+        var err = new Error(data.error || 'POST failed')
+        err.data = data
+        throw err
+      }
       return data
     })
   }
@@ -163,6 +167,14 @@
 
   // ── Onchain authorization (EIP-3009) ─────────────────────────────
 
+  function startHeartbeat() {
+    setInterval(function () {
+      if (authRequestId) {
+        sidecarGet('/session/' + authRequestId).catch(function () {})
+      }
+    }, 10000)
+  }
+
   function doAuthorization(session) {
     // 1. Connect wallet
     if (!window.ethereum) {
@@ -173,7 +185,33 @@
       return
     }
 
-    window.ethereum.request({ method: 'eth_requestAccounts' }).then(function (accounts) {
+    var targetChainId = '0x' + Number(session.usdc_chain_id).toString(16)
+    
+    // Switch to Arc Testnet before prompting accounts/signature
+    window.ethereum.request({ method: 'eth_chainId' }).then(function (chainId) {
+      if (chainId !== targetChainId) {
+        return window.ethereum.request({
+          method: 'wallet_switchEthereumChain',
+          params: [{ chainId: targetChainId }]
+        }).catch(function (err) {
+          if (err.code === 4902) {
+            return window.ethereum.request({
+              method: 'wallet_addEthereumChain',
+              params: [{
+                chainId: targetChainId,
+                chainName: 'Arc Testnet',
+                nativeCurrency: { name: 'Arc ETH', symbol: 'ETH', decimals: 18 },
+                rpcUrls: ['https://rpc.testnet.arc.network'],
+                blockExplorerUrls: ['https://testnet.arcscan.app']
+              }]
+            })
+          }
+          throw err
+        })
+      }
+    }).then(function () {
+      return window.ethereum.request({ method: 'eth_requestAccounts' })
+    }).then(function (accounts) {
       viewerAddress = accounts[0]
       return buildAndSign(session, viewerAddress)
     }).then(function (authorization) {
@@ -184,11 +222,34 @@
     }).then(function () {
       removeModal()
       showToast('Authorized! You will be charged ~$' + (tierCents / 100).toFixed(2))
+      startHeartbeat()
     }).catch(function (err) {
       console.warn('[owncast-pay] Auth failed:', err)
+      if (err && err.data && err.data.error === 'signer_mismatch') {
+        var correctSigner = err.data.signer
+        showToast('Wallet mismatch. Re-signing with: ' + correctSigner.substring(0, 8) + '...')
+        // Re-attempt signing using the correct signer address returned by the server
+        return buildAndSign(session, correctSigner).then(function (authorization) {
+          return sidecarPost('/authorize/' + authRequestId, {
+            tier_cents: tierCents,
+            authorization: authorization,
+          })
+        }).then(function () {
+          removeModal()
+          showToast('Authorized! You will be charged ~$' + (tierCents / 100).toFixed(2))
+          startHeartbeat()
+        }).catch(function (secondErr) {
+          console.warn('[owncast-pay] Second auth attempt failed:', secondErr)
+          sidecarPost('/decline/' + authRequestId).catch(function () {})
+          removeModal()
+          showToast('Watching for free (wallet error)')
+          startHeartbeat()
+        })
+      }
       sidecarPost('/decline/' + authRequestId).catch(function () {})
       removeModal()
       showToast('Watching for free (wallet error)')
+      startHeartbeat()
     })
   }
 
@@ -196,19 +257,22 @@
     var nonce = '0x' + Array.from(crypto.getRandomValues(new Uint8Array(32)))
       .map(function (b) { return b.toString(16).padStart(2, '0') }).join('')
 
-    var value = String(tierCents * 10000)
-    var validBefore = String(session.valid_before)
+    var value = Number(tierCents * 10000)
+    var validBefore = Number(session.valid_before)
+    var validAfter = 0
 
     var message = {
       from: viewerAddress,
       to: session.streamer_wallet,
       value: value,
-      validAfter: '0',
+      validAfter: validAfter,
       validBefore: validBefore,
       nonce: nonce,
     }
 
-    var typedData = JSON.stringify({
+    showToast('Waiting for wallet signature...')
+
+    var typedData = {
       domain: {
         name: 'USDC',
         version: '2',
@@ -216,6 +280,12 @@
         verifyingContract: session.usdc_contract,
       },
       types: {
+        EIP712Domain: [
+          { name: 'name', type: 'string' },
+          { name: 'version', type: 'string' },
+          { name: 'chainId', type: 'uint256' },
+          { name: 'verifyingContract', type: 'address' }
+        ],
         TransferWithAuthorization: [
           { name: 'from', type: 'address' },
           { name: 'to', type: 'address' },
@@ -227,9 +297,7 @@
       },
       message: message,
       primaryType: 'TransferWithAuthorization',
-    })
-
-    showToast('Waiting for wallet signature...')
+    }
 
     return window.ethereum.request({
       method: 'eth_signTypedData_v4',
@@ -238,13 +306,17 @@
       var sig = signature.replace('0x', '')
       var r = '0x' + sig.substring(0, 64)
       var s = '0x' + sig.substring(64, 128)
-      var v = parseInt(sig.substring(128, 130), 16).toString(16)
+      var vVal = parseInt(sig.substring(128, 130), 16)
+      if (vVal < 27) {
+        vVal += 27
+      }
+      var v = vVal.toString(16)
       return {
         from: viewerAddress,
         to: session.streamer_wallet,
-        value: value,
-        validAfter: '0',
-        validBefore: validBefore,
+        value: String(value),
+        validAfter: String(validAfter),
+        validBefore: String(validBefore),
         nonce: nonce,
         v: v,
         r: r,

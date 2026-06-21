@@ -80,6 +80,10 @@ def settle_authorization(signed_auth: dict) -> str:
     else:
         v = int(v_val)
 
+    # Normalize recovery byte v to 27 or 28 if raw recovery ID is passed
+    if v < 27:
+        v += 27
+
     print(f"[settle] Formulated transaction parameters:")
     print(f"  Sender: {from_address} -> Streamer: {to_address}")
     print(f"  USDC Value: {value / 1_000_000.0} USDC (scaled: {value})")

@@ -38,6 +38,7 @@ class Session:
     amount_charged_usdc: Optional[float] = None
     tx_hash: Optional[str] = None
     settled_at: Optional[datetime] = None
+    last_seen_at: Optional[datetime] = None
 
     @property
     def duration_sec(self) -> float:
@@ -68,7 +69,7 @@ class Ledger:
             if existing and not existing.settled:
                 # Force settle existing session if they rejoined without parting
                 self._settle(existing)
-            s = Session(user_id=user_id, username=username, joined_at=ts)
+            s = Session(user_id=user_id, username=username, joined_at=ts, last_seen_at=ts)
             self.active[user_id] = s
             return s
 
@@ -100,7 +101,7 @@ class Ledger:
         with self.lock:
             stale_ids = [
                 uid for uid, s in self.active.items()
-                if (now - s.joined_at).total_seconds() > config.STALE_SESSION_TIMEOUT_SEC
+                if (now - (s.last_seen_at or s.joined_at)).total_seconds() > config.STALE_SESSION_TIMEOUT_SEC
             ]
             for uid in stale_ids:
                 s = self.active[uid]
