@@ -10,7 +10,9 @@
 (function () {
   'use strict'
 
-  var SIDECAR = 'http://localhost:8081'
+  // Derive sidecar host from the page origin so remote viewers reach
+  // the server's sidecar instead of resolving localhost on their own machine.
+  var SIDECAR = window.location.protocol + '//' + window.location.hostname + ':8081'
   var POLL_INTERVAL = 2000
   var MODAL_Z = 99999
   var UID_KEY = '_owncast_pay_uid'

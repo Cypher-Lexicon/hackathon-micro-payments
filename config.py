@@ -24,7 +24,10 @@ def _load_env_file(filepath=".env"):
 _load_env_file()
 
 # Sidecar Server Bind Config
-SIDECAR_HOST = os.environ.get("SIDECAR_HOST", "127.0.0.1")
+# Bind to 0.0.0.0 so remote viewers on other hosts can reach the sidecar.
+# Update the JS sidecar URL (static/owncast-pay.js) to match your server's
+# hostname/IP when deploying outside localhost.
+SIDECAR_HOST = os.environ.get("SIDECAR_HOST", "0.0.0.0")
 SIDECAR_PORT = int(os.environ.get("SIDECAR_PORT", "8081"))
 
 # Stream Pricing configuration
