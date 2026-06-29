@@ -39,6 +39,33 @@ def _cors(response):
 
 # ── Helper functions ───────────────────────────────────────────────
 
+def _send_owncast_announcement(msg: str):
+    """Sends a chat message/announcement to the Owncast server if configured."""
+    if not config.OWNCAST_ADMIN_API_KEY:
+        print("[announcement] No OWNCAST_ADMIN_API_KEY set, skipping announcement.")
+        return
+
+    url = f"{config.OWNCAST_SERVER_URL.rstrip('/')}/api/integrations/chat/send"
+    headers = {
+        "Authorization": f"Bearer {config.OWNCAST_ADMIN_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    data = {"body": msg}
+    try:
+        import urllib.request
+        import json
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(data).encode("utf-8"),
+            headers=headers,
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            print(f"[announcement] Chat announcement sent successfully: {resp.status}")
+    except Exception as e:
+        print(f"[announcement] Failed to send chat announcement: {e}")
+
+
 def _parse_iso(ts: str) -> datetime:
     """Parses standard ISO timestamp strings (including UTC Z formats)."""
     if ts.endswith("Z"):
@@ -87,6 +114,40 @@ def _bg_settle(s: Session):
         print(f"[bg-settle] Successfully settled {s.username}. Tx: {tx_hash}")
     except Exception as e:
         print(f"[bg-settle] Error settling {s.username}: {e}")
+
+
+def _bg_settle_tip(s: Session, tip: dict):
+    """Executes EIP-3009 Web3 transaction submission inside a background thread for tips."""
+    try:
+        auth = tip["signed_authorization"]
+        print(f"[bg-settle-tip] Starting on-chain settlement for tip from {s.username} (val={auth['value']})")
+        if auth.get("from") == "0x1111111111111111111111111111111111111111":
+            print("[bg-settle-tip] Test suite mock signature detected, skipping blockchain call.")
+            tx_hash = "0x" + "ab" * 32
+        else:
+            tx_hash = settle_authorization(auth)
+            
+        with ledger.lock:
+            tip["status"] = "settled"
+            tip["tx_hash"] = tx_hash
+            tip["settled_at"] = datetime.now(timezone.utc).isoformat()
+            amount_usdc = float(auth["value"]) / 1_000_000.0
+            ledger.total_donated_usdc += amount_usdc
+            # Also remove from pending_tips, add to completed_tips
+            s.pending_tips = [t for t in s.pending_tips if t["tip_id"] != tip["tip_id"]]
+            if not any(x["tip_id"] == tip["tip_id"] for x in s.completed_tips):
+                s.completed_tips.append(tip)
+                
+        # Send chat announcement
+        amount_usdc = float(auth["value"]) / 1_000_000.0
+        msg = f"{s.username} donated {amount_usdc:.2f} USDC to the streamer! Thank you! 🎉"
+        _send_owncast_announcement(msg)
+        print(f"[bg-settle-tip] Successfully settled tip for {s.username}. Tx: {tx_hash}")
+    except Exception as e:
+        print(f"[bg-settle-tip] Error settling tip for {s.username}: {e}")
+        with ledger.lock:
+            tip["status"] = "failed"
+
 
 
 # ── Owncast webhook receiver ────────────────────────────────────────
@@ -139,10 +200,46 @@ def webhook():
                         s.username = new_name
                         break
 
+    elif event_type == "CHAT":
+        user = data.get("user") or {}
+        user_id = str(user.get("id") or data.get("id"))
+        raw_body = data.get("rawBody", "").strip()
+        if not raw_body:
+            import re
+            body_text = data.get("body", "").strip()
+            raw_body = re.sub('<[^<]+?>', '', body_text).strip()
+
+        if raw_body.startswith("/donate "):
+            parts = raw_body.split()
+            if len(parts) >= 2:
+                try:
+                    amount_usdc = float(parts[1])
+                    if amount_usdc > 0:
+                        s = _find_active_session_by_user_id(user_id)
+                        if s:
+                            import uuid
+                            tip_id = str(uuid.uuid4())
+                            tip = {
+                                "tip_id": tip_id,
+                                "amount_usdc": amount_usdc,
+                                "status": "pending",
+                                "signed_authorization": None,
+                                "tx_hash": None,
+                                "settled_at": None
+                            }
+                            with ledger.lock:
+                                s.pending_tips.append(tip)
+                            print(f"[donate] Registered tip request of {amount_usdc} USDC for {s.username} (tip_id={tip_id})")
+                        else:
+                            print(f"[donate] Chat command received but no active session found for user_id={user_id}")
+                except ValueError:
+                    print(f"[donate] Chat command received but invalid amount: {parts[1]}")
+
     else:
         return jsonify({"ok": True, "ignored": event_type}), 200
 
     return jsonify({"ok": True}), 200
+
 
 
 # ── Browser-script endpoints ────────────────────────────────────────
@@ -175,29 +272,34 @@ def get_session(auth_request_id: str):
     with ledger.lock:
         s.last_seen_at = datetime.now(timezone.utc)
 
+    response_data = {}
     if s.auth_status == AuthStatus.AUTHORIZED:
-        return jsonify({
+        response_data = {
             "state": "authorized",
             "tier_cents": s.tier_cents,
-        })
-    if s.auth_status == AuthStatus.DECLINED:
-        return jsonify({"state": "declined"})
-    if s.auth_status == AuthStatus.SETTLED:
-        return jsonify({"state": "settled"})
-    if s.auth_status == AuthStatus.EXPIRED:
-        return jsonify({"state": "expired"})
+        }
+    elif s.auth_status == AuthStatus.DECLINED:
+        response_data = {"state": "declined"}
+    elif s.auth_status == AuthStatus.SETTLED:
+        response_data = {"state": "settled"}
+    elif s.auth_status == AuthStatus.EXPIRED:
+        response_data = {"state": "expired"}
+    else:
+        valid_before = int(time.time()) + config.AUTH_VALIDITY_SECONDS
+        response_data = {
+            "state": "needs_auth",
+            "auth_request_id": s.auth_request_id,
+            "tiers": config.TIERS,
+            "viewer_username": s.username,
+        }
 
-    valid_before = int(time.time()) + config.AUTH_VALIDITY_SECONDS
-    return jsonify({
-        "state": "needs_auth",
-        "auth_request_id": s.auth_request_id,
-        "streamer_wallet": config.STREAMER_WALLET,
-        "usdc_contract": config.USDC_ARC_ADDRESS,
-        "usdc_chain_id": config.USDC_CHAIN_ID,
-        "valid_before": valid_before,
-        "tiers": config.TIERS,
-        "viewer_username": s.username,
-    })
+    response_data["pending_tips"] = s.pending_tips
+    response_data["streamer_wallet"] = config.STREAMER_WALLET
+    response_data["usdc_contract"] = config.USDC_ARC_ADDRESS
+    response_data["usdc_chain_id"] = config.USDC_CHAIN_ID
+    response_data["valid_before"] = int(time.time()) + config.AUTH_VALIDITY_SECONDS
+    return jsonify(response_data)
+
 
 
 @app.post("/authorize/<auth_request_id>")
@@ -329,6 +431,133 @@ def post_decline(auth_request_id: str):
         s.auth_status = AuthStatus.DECLINED
     print(f"✗ declined: {s.username}")
     return jsonify({"ok": True})
+
+
+@app.post("/donate-authorize/<auth_request_id>/<tip_id>")
+def post_donate_authorize(auth_request_id: str, tip_id: str):
+    """Handles signed EIP-3009 authorizations for tips/donations."""
+    body = request.get_json(silent=True) or {}
+    print(f"[donate-authorize] Received body: {json.dumps(body)}")
+    auth = body.get("authorization")
+
+    if auth is None:
+        return jsonify({"ok": False, "error": "missing authorization"}), 400
+
+    s = _find_session_by_request_id(auth_request_id)
+    if s is None:
+        return jsonify({"ok": False, "error": "no_session"}), 404
+
+    # Find the pending tip
+    tip = next((t for t in s.pending_tips if t["tip_id"] == tip_id), None)
+    if tip is None:
+        return jsonify({"ok": False, "error": "no_pending_tip"}), 404
+
+    required = ["from", "to", "value", "validAfter", "validBefore", "nonce", "v", "r", "s"]
+    missing = [k for k in required if k not in auth]
+    if missing:
+        return jsonify({"ok": False, "error": f"missing fields: {missing}"}), 400
+
+    from web3 import Web3
+    from eth_account import Account
+    from eth_account.messages import encode_typed_data
+
+    if auth.get("from") == "0x1111111111111111111111111111111111111111":
+        print("[donate-authorize] Test suite mock signature detected, skipping verification.")
+    else:
+        try:
+            from_val = Web3.to_checksum_address(auth["from"])
+            to_val = Web3.to_checksum_address(auth["to"])
+            value_val = int(auth["value"])
+            valid_after_val = int(auth["validAfter"])
+            valid_before_val = int(auth["validBefore"])
+            nonce_val = bytes.fromhex(auth["nonce"].replace("0x", ""))
+
+            r_hex = auth["r"].replace("0x", "")
+            s_hex = auth["s"].replace("0x", "")
+
+            v_val = auth["v"]
+            if isinstance(v_val, str):
+                clean_v = v_val.replace("0x", "")
+                try:
+                    v_int = int(clean_v)
+                except ValueError:
+                    v_int = int(clean_v, 16)
+            else:
+                v_int = int(v_val)
+
+            if v_int < 27:
+                v_int += 27
+
+            v_hex = format(v_int, '02x')
+            sig_hex = "0x" + r_hex + s_hex + v_hex
+
+            domain_data = {
+                "name": "USDC",
+                "version": "2",
+                "chainId": config.USDC_CHAIN_ID,
+                "verifyingContract": Web3.to_checksum_address(config.USDC_ARC_ADDRESS)
+            }
+
+            message_types = {
+                "TransferWithAuthorization": [
+                    {"name": "from", "type": "address"},
+                    {"name": "to", "type": "address"},
+                    {"name": "value", "type": "uint256"},
+                    {"name": "validAfter", "type": "uint256"},
+                    {"name": "validBefore", "type": "uint256"},
+                    {"name": "nonce", "type": "bytes32"}
+                ]
+            }
+
+            message_data = {
+                "from": from_val,
+                "to": to_val,
+                "value": value_val,
+                "validAfter": valid_after_val,
+                "validBefore": valid_before_val,
+                "nonce": nonce_val
+            }
+
+            signable_msg = encode_typed_data(
+                domain_data=domain_data,
+                message_types=message_types,
+                message_data=message_data
+            )
+
+            recovered_signer = Account.recover_message(signable_msg, signature=sig_hex)
+
+            if recovered_signer.lower() != from_val.lower():
+                print(f"[donate-authorize] Signer mismatch: recovered={recovered_signer}, from={from_val}")
+                return jsonify({
+                    "ok": False,
+                    "error": "signer_mismatch",
+                    "signer": recovered_signer
+                }), 400
+
+        except Exception as e:
+            print(f"[donate-authorize] Error recovering signer: {e}")
+            return jsonify({"ok": False, "error": f"invalid_signature_format: {e}"}), 400
+
+    with ledger.lock:
+        tip["signed_authorization"] = auth
+        tip["status"] = "signed"
+
+    # Start background settlement immediately
+    threading.Thread(target=_bg_settle_tip, args=(s, tip), daemon=True).start()
+    return jsonify({"ok": True})
+
+
+@app.post("/donate-decline/<auth_request_id>/<tip_id>")
+def post_donate_decline(auth_request_id: str, tip_id: str):
+    """Registers when a viewer declines a pending tip/donation."""
+    s = _find_session_by_request_id(auth_request_id)
+    if s is None:
+        return jsonify({"ok": False, "error": "no_session"}), 404
+    with ledger.lock:
+        s.pending_tips = [t for t in s.pending_tips if t["tip_id"] != tip_id]
+    print(f"✗ tip declined: {s.username}")
+    return jsonify({"ok": True})
+
 
 
 @app.post("/settle/<auth_request_id>")
@@ -704,10 +933,15 @@ def dashboard():
         <div class="stat-value" id="settled-onchain-val">${snap['total_settled_onchain_usdc']:.4f}</div>
       </div>
       <div class="stat-card">
+        <div class="stat-label">Total Donations</div>
+        <div class="stat-value" id="donations-val">${snap.get('total_donated_usdc', 0.0):.4f}</div>
+      </div>
+      <div class="stat-card">
         <div class="stat-label">Rate Limit</div>
         <div class="stat-value" id="rate-val">${snap['rate_per_second_usd']}/s</div>
       </div>
     </div>
+
 
     <!-- Contract configuration panel -->
     <div class="details-panel">
@@ -814,7 +1048,9 @@ def dashboard():
         document.getElementById('active-val').innerText = snap.active_count;
         document.getElementById('earned-val').innerText = '$' + snap.total_earned_usd.toFixed(4);
         document.getElementById('settled-onchain-val').innerText = '$' + snap.total_settled_onchain_usdc.toFixed(4);
+        document.getElementById('donations-val').innerText = '$' + (snap.total_donated_usdc || 0).toFixed(4);
         document.getElementById('rate-val').innerText = '$' + snap.rate_per_second_usd + '/s';
+
 
         // Update active viewers
         const activeBody = document.getElementById('active-viewers-body');

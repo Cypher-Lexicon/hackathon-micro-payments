@@ -39,6 +39,9 @@ class Session:
     tx_hash: Optional[str] = None
     settled_at: Optional[datetime] = None
     last_seen_at: Optional[datetime] = None
+    pending_tips: list[dict] = field(default_factory=list)
+    completed_tips: list[dict] = field(default_factory=list)
+
 
     @property
     def duration_sec(self) -> float:
@@ -61,6 +64,8 @@ class Ledger:
     total_earned_usd: float = 0.0
     total_viewer_seconds: float = 0.0
     total_settled_onchain_usdc: float = 0.0
+    total_donated_usdc: float = 0.0
+
 
     def join(self, user_id: str, username: str, ts: datetime) -> Session:
         """Registers a new user join event. Handles re-joins thread-safely."""
@@ -129,6 +134,8 @@ class Ledger:
                         "auth_status": s.auth_status.value,
                         "tier_cents": s.tier_cents,
                         "auth_request_id": s.auth_request_id,
+                        "pending_tips": s.pending_tips,
+                        "completed_tips": s.completed_tips,
                     }
                     for s in self.active.values()
                 ],
@@ -137,6 +144,8 @@ class Ledger:
                 "total_earned_usd": round(self.total_earned_usd, 6),
                 "total_viewer_seconds": round(self.total_viewer_seconds, 2),
                 "total_settled_onchain_usdc": round(self.total_settled_onchain_usdc, 6),
+                "total_donated_usdc": round(self.total_donated_usdc, 6),
+
                 "recent_settlements": [
                     {
                         "username": s.username,

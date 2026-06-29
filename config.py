@@ -58,3 +58,9 @@ ARC_RPC_URL = os.environ.get("ARC_RPC_URL", "https://rpc.testnet.arc.network")
 
 # Private key of the streamer wallet (used to pay gas & settle transactions on-chain)
 STREAMER_PRIVATE_KEY = os.environ.get("STREAMER_PRIVATE_KEY")
+
+# Owncast Admin API key for posting chat announcements
+OWNCAST_ADMIN_API_KEY = os.environ.get("OWNCAST_ADMIN_API_KEY")
+# Owncast base URL to construct the chat integration endpoint
+OWNCAST_SERVER_URL = os.environ.get("OWNCAST_SERVER_URL", "http://localhost:8080")
+

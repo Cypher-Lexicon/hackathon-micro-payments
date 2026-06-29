@@ -20,6 +20,7 @@
   var authRequestId = null
   var tierCents = null
   var viewerAddress = null
+  var activeTips = {}
 
   // ── Identity: read Owncast frontend's accessToken, grab user.id ──
 
@@ -133,6 +134,193 @@
 
   // ── Session poll loop ────────────────────────────────────────────
 
+  function handlePendingTips(data) {
+    if (!data.pending_tips || data.pending_tips.length === 0) return;
+
+    data.pending_tips.forEach(function (tip) {
+      var tid = tip.tip_id;
+      if (activeTips[tid]) return; // already prompted/prompting
+
+      activeTips[tid] = true;
+      showTipConfirmModal(tip.amount_usdc).then(function (accepted) {
+        if (accepted) {
+          doTipAuthorization(data, tip);
+        } else {
+          sidecarPost('/donate-decline/' + authRequestId + '/' + tid).catch(function () {});
+          delete activeTips[tid];
+        }
+      });
+    });
+  }
+
+  function showTipConfirmModal(amount) {
+    return new Promise(function (resolve) {
+      var overlay = document.createElement('div');
+      overlay.id = 'owncast-pay-tip-overlay';
+      overlay.style.cssText = [
+        'position:fixed;inset:0;background:rgba(0,0,0,0.8);',
+        'display:flex;align-items:center;justify-content:center;',
+        'z-index:' + MODAL_Z + ';font-family:system-ui,sans-serif;',
+      ].join('');
+
+      overlay.innerHTML = (
+        '<div style="background:#1a1a2e;border:1px solid #333;border-radius:12px;'
+        + 'padding:28px;max-width:380px;width:90%;color:#fff;box-shadow:0 10px 40px rgba(0,0,0,0.5);text-align:center;">'
+        + '<h3 style="margin:0 0 12px;font-size:18px;color:#00d4aa;">Confirm Donation</h3>'
+        + '<p style="margin:0 0 16px;color:#aaa;font-size:14px;">'
+        + 'Would you like to donate <strong style="color:#00d4aa;font-size:18px;">' + amount.toFixed(2) + ' USDC</strong>'
+        + ' to the streamer?</p>'
+        + '<button id="oct-confirm" style="width:100%;padding:12px;background:#00d4aa;'
+        + 'border:none;border-radius:8px;color:#111;cursor:pointer;font-size:15px;font-weight:700;margin-bottom:8px;">'
+        + 'Sign and Donate</button>'
+        + '<button id="oct-decline" style="width:100%;padding:12px;background:transparent;'
+        + 'border:1px solid #444;border-radius:8px;color:#aaa;cursor:pointer;font-size:14px;">'
+        + 'Decline</button>'
+        + '</div>'
+      );
+
+      document.body.appendChild(overlay);
+
+      overlay.querySelector('#oct-confirm').addEventListener('click', function () {
+        overlay.remove();
+        resolve(true);
+      });
+
+      overlay.querySelector('#oct-decline').addEventListener('click', function () {
+        overlay.remove();
+        resolve(false);
+      });
+    });
+  }
+
+  function doTipAuthorization(session, tip) {
+    if (!window.ethereum) {
+      showInstallToast();
+      sidecarPost('/donate-decline/' + authRequestId + '/' + tip.tip_id).catch(function () {});
+      delete activeTips[tip.tip_id];
+      return;
+    }
+
+    var targetChainId = '0x' + Number(session.usdc_chain_id).toString(16);
+    
+    window.ethereum.request({ method: 'eth_chainId' }).then(function (chainId) {
+      if (chainId !== targetChainId) {
+        return window.ethereum.request({
+          method: 'wallet_switchEthereumChain',
+          params: [{ chainId: targetChainId }]
+        }).catch(function (err) {
+          if (err.code === 4902) {
+            return window.ethereum.request({
+              method: 'wallet_addEthereumChain',
+              params: [{
+                chainId: targetChainId,
+                chainName: 'Arc Testnet',
+                nativeCurrency: { name: 'Arc ETH', symbol: 'ETH', decimals: 18 },
+                rpcUrls: ['https://rpc.testnet.arc.network'],
+                blockExplorerUrls: ['https://testnet.arcscan.app']
+              }]
+            });
+          }
+          throw err;
+        });
+      }
+    }).then(function () {
+      return window.ethereum.request({ method: 'eth_requestAccounts' });
+    }).then(function (accounts) {
+      var activeAddress = accounts[0];
+      return buildAndSignTip(session, tip, activeAddress);
+    }).then(function (authorization) {
+      return sidecarPost('/donate-authorize/' + authRequestId + '/' + tip.tip_id, {
+        authorization: authorization,
+      });
+    }).then(function () {
+      showToast('Donation of ' + tip.amount_usdc.toFixed(2) + ' USDC sent! 🎉');
+      delete activeTips[tip.tip_id];
+    }).catch(function (err) {
+      console.warn('[owncast-pay] Tip auth failed:', err);
+      sidecarPost('/donate-decline/' + authRequestId + '/' + tip.tip_id).catch(function () {});
+      delete activeTips[tip.tip_id];
+      showToast('Donation failed or cancelled');
+    });
+  }
+
+  function buildAndSignTip(session, tip, viewerAddress) {
+    var nonce = '0x' + Array.from(crypto.getRandomValues(new Uint8Array(32)))
+      .map(function (b) { return b.toString(16).padStart(2, '0') }).join('');
+
+    var value = Number(tip.amount_usdc * 1000000); // USDC has 6 decimals
+    var validBefore = Number(session.valid_before);
+    var validAfter = 0;
+
+    var message = {
+      from: viewerAddress,
+      to: session.streamer_wallet,
+      value: String(value),
+      validAfter: validAfter,
+      validBefore: validBefore,
+      nonce: nonce,
+    };
+
+    showToast('Waiting for wallet signature for donation...');
+
+    return window.ethereum.request({ method: 'eth_accounts' }).then(function (accounts) {
+      var activeAddress = accounts[0] || viewerAddress;
+      message.from = activeAddress;
+      
+      var updatedTypedData = {
+        domain: {
+          name: 'USDC',
+          version: '2',
+          chainId: Number(session.usdc_chain_id),
+          verifyingContract: session.usdc_contract,
+        },
+        types: {
+          EIP712Domain: [
+            { name: 'name', type: 'string' },
+            { name: 'version', type: 'string' },
+            { name: 'chainId', type: 'uint256' },
+            { name: 'verifyingContract', type: 'address' }
+          ],
+          TransferWithAuthorization: [
+            { name: 'from', type: 'address' },
+            { name: 'to', type: 'address' },
+            { name: 'value', type: 'uint256' },
+            { name: 'validAfter', type: 'uint256' },
+            { name: 'validBefore', type: 'uint256' },
+            { name: 'nonce', type: 'bytes32' },
+          ],
+        },
+        message: message,
+        primaryType: 'TransferWithAuthorization',
+      };
+
+      return window.ethereum.request({
+        method: 'eth_signTypedData_v4',
+        params: [activeAddress, updatedTypedData],
+      }).then(function (signature) {
+        var sig = signature.replace('0x', '')
+        var r = '0x' + sig.substring(0, 64)
+        var s = '0x' + sig.substring(64, 128)
+        var vVal = parseInt(sig.substring(128, 130), 16)
+        if (vVal < 27) {
+          vVal += 27
+        }
+        var v = vVal.toString(16)
+        return {
+          from: activeAddress,
+          to: session.streamer_wallet,
+          value: String(value),
+          validAfter: String(validAfter),
+          validBefore: String(validBefore),
+          nonce: nonce,
+          v: v,
+          r: r,
+          s: s,
+        };
+      });
+    });
+  }
+
   function pollSession() {
     return new Promise(function (resolve, reject) {
       var maxTries = 300  // 10 minutes max
@@ -140,6 +328,9 @@
 
       var poll = setInterval(function () {
         sidecarGet('/session/' + authRequestId).then(function (data) {
+          if (data.pending_tips) {
+            handlePendingTips(data);
+          }
           if (data.state === 'needs_auth') {
             clearInterval(poll)
             showTierModal(data.tiers, data.viewer_username).then(function (tier) {
@@ -172,10 +363,15 @@
   function startHeartbeat() {
     setInterval(function () {
       if (authRequestId) {
-        sidecarGet('/session/' + authRequestId).catch(function () {})
+        sidecarGet('/session/' + authRequestId).then(function (data) {
+          if (data.pending_tips) {
+            handlePendingTips(data);
+          }
+        }).catch(function () {})
       }
-    }, 10000)
+    }, 5000)
   }
+
 
   function doAuthorization(session) {
     // 1. Connect wallet
