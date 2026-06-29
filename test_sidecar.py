@@ -41,7 +41,7 @@ def get(url):
 
 
 def post_event(event_type: str, user_id: str, display_name: str,
-               ts: datetime) -> None:
+               ts: datetime, body: str = None) -> None:
     payload = {
         "type": event_type,
         "eventData": {
@@ -50,8 +50,12 @@ def post_event(event_type: str, user_id: str, display_name: str,
             "user": {"id": user_id, "displayName": display_name},
         },
     }
+    if body is not None:
+        payload["eventData"]["body"] = f"<p>{body}</p>"
+        payload["eventData"]["rawBody"] = body
     post(f"{SIDECAR_URL}/webhook", payload)
-    print(f"  -> {event_type} ({display_name})")
+    print(f"  -> {event_type} ({display_name}) body={body}")
+
 
 
 def fetch_snapshot():
@@ -146,8 +150,55 @@ def main():
     # Don't part or auth — let the reaper handle it
     time.sleep(40)  # wait past STALE_SESSION_TIMEOUT_SEC (30s) + slack
 
+    # ── Scenario 5: donation / tipping flow ────────────────────────
+    print("\nScenario 5: donation / tipping flow")
+    uid4 = str(uuid.uuid4())
+    post_event("USER_JOINED", uid4, "dave", base + timedelta(seconds=3))
+    
+    # Check session
+    lookup, _ = get(f"{SIDECAR_URL}/lookup/by-user-id/{uid4}")
+    req4 = lookup["auth_request_id"]
+    
+    # Send CHAT message with donation command
+    post_event("CHAT", uid4, "dave", base + timedelta(seconds=4), body="/donate 15.5")
+    
+    # Poll session, it should have a pending tip
+    sess, _ = get(f"{SIDECAR_URL}/session/{req4}")
+    assert "pending_tips" in sess, "pending_tips should be in session response"
+    assert len(sess["pending_tips"]) == 1, "should have one pending tip"
+    tip = sess["pending_tips"][0]
+    assert_eq(tip["amount_usdc"], 15.5, "tip amount")
+    
+    # Authorize donation
+    fake_tip_auth = {
+        "from": "0x" + "11" * 20,
+        "to": sess["streamer_wallet"],
+        "value": "15500000",   # $15.50 in 6-decimal USDC
+        "validAfter": "0",
+        "validBefore": str(sess["valid_before"]),
+        "nonce": "0x" + "55" * 32,
+        "v": "1b",
+        "r": "0x" + "66" * 32,
+        "s": "0x" + "77" * 32,
+    }
+    r = post(f"{SIDECAR_URL}/donate-authorize/{req4}/{tip['tip_id']}", {
+        "authorization": fake_tip_auth,
+    })
+    assert_eq(r["ok"], True, "tip authorize accepted")
+    
+    # Wait a moment for background settlement thread
+    time.sleep(0.5)
+    
+    # Check that donations total is updated
+    snap = fetch_snapshot()
+    assert_eq(snap["total_donated_usdc"], 15.5, "total donated usdc")
+    
+    # Clean up dave parting
+    post_event("USER_PARTED", uid4, "dave", base + timedelta(seconds=60))
+
     # ── Final assertions ────────────────────────────────────────────
     snap = fetch_snapshot()
+
     print("\nFinal snapshot:")
 
     alice_settled = next(s for s in snap["recent_settlements"] if s["username"] == "alice")
